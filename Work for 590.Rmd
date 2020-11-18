@@ -1,0 +1,336 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(tidytext)
+library(tm)
+library(NLP)
+library(stats)
+library(quanteda)
+library(quanteda.textmodels)
+library(ggplot2)
+library(caret)
+library(e1071)
+library(ranger)
+library(tibble)
+library(tidyverse)
+library(LiblineaR)
+library(naivebayes)
+library(caTools)
+
+gc()
+
+```
+
+
+
+
+```{r}
+# Data Loading 
+
+data1 <- read.csv("C:/Users/hcho1/Desktop/Data/Data.csv")
+
+data1$category <- ifelse(data1$category == 2, "other listing", "narcotics")
+
+data2 <- data1[data1$category == "narcotics",]
+
+set.seed(100)
+data2 <- data2[sample(1:nrow(data2), 0.49*nrow(data2), replace = F),]
+data3 <- data1[data1$category == "other listing",]
+
+data1 <- rbind(data2,data3)
+data1 <- na.omit(data1)
+
+
+```
+
+
+```{r}
+#clearning the data 
+
+data_clean1 <- data1 %>% 
+  mutate(id  =  1:n(),
+         text = paste(name, description)) %>% 
+  select(id, category, text)
+
+
+
+data_clean1 %>%
+  ggplot(aes(category)) +
+  geom_bar() 
+
+#bag of words
+data_counts1 <- map_df(1:2, 
+                      ~unnest_tokens(data_clean1,word,text,
+                                     token = "ngrams", n = .x)) %>% 
+  count(id,word,sort = T)
+
+# words appear in at least 15 listings 
+words_15 <- data_counts1 %>%
+  group_by(word) %>%
+  summarise(n = n()) %>% 
+  filter(n >= 15) %>%
+  select(word)
+
+data_dtm1 <- data_counts1 %>% 
+  right_join(words_15, by = "word") %>% 
+  bind_tf_idf(word, id, n) %>% 
+  cast_dtm(id, word, tf_idf)
+
+
+
+meta1 <- tibble(id = as.numeric(dimnames(data_dtm1)[[1]])) %>%
+  left_join(data_clean1[!duplicated(data_clean1$id), ], by = "id")
+
+
+#training and testing indices 
+
+set.seed(1000)
+
+train_i <- createDataPartition(complete.cases(meta1$category), p = 0.75, list = FALSE, times = 1)
+
+
+train <- data_dtm1[train_i, ] %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+test <- data_dtm1[-train_i, ] %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+response_train <- meta1$category[train_i]
+response_train <- factor(response_train)
+
+
+```
+#summary stats 
+
+```{r}
+#histogram 
+
+
+png("Category Freq.png")
+ggplot(data = data1, aes(market_name)) + 
+  geom_bar(aes(fill = category)) + 
+  xlab("Market Name") + 
+  ylab("Count") + 
+  ggtitle("Distribution of Product Listing Categories by Market")
+dev.off()
+
+```
+
+```{r}
+png("Category Distribution.png")
+ggplot(data1, aes(price)) + 
+  geom_density(aes(fill = category), alpha = 0.5) + 
+  xlim(0,5) + ylab("Density") + 
+  xlab("Price in Bitcoin") + 
+  ggtitle("Density Plot - Price of Product Listings") + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+dev.off()
+  
+```
+
+
+```{r}
+training_tibble  <- as_tibble(data1) %>% 
+   mutate(docid = 1:n(),
+         text = paste(name, description)) %>% 
+  select(docid,category,text)
+  
+training_tokens <- training_tibble %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  mutate(word = SnowballC::wordStem(word))
+
+
+doc_matrix <- training_tokens %>% 
+  count(docid,word) %>% 
+  cast_dtm(document =docid, term = word, value = n)
+
+training_tokens %>% 
+  count(docid,word) %>% 
+  cast_dtm(document = docid, term = word, value = n, weighting = tm::weightTfIdf)
+
+#sparse matrices 
+doc_matrix <- removeSparseTerms(doc_matrix, sparse = 0.99)
+
+training_tfidf <- training_tokens %>% 
+  count(category, word) %>% 
+  bind_tf_idf(term = word, document = category, n = n)
+
+#plots words most frequently used
+
+plot_cat <- training_tfidf %>%  
+  arrange(desc(tf_idf)) %>% 
+  mutate(word = factor(word, levels = rev(unique(word))))
+                       
+word_imp <- plot_cat %>%
+  filter(category %in% c("narcotics",
+                      "other listing"
+                      )) %>%
+  group_by(category) %>%
+  top_n(15) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, tf_idf, category)) %>%
+  ggplot(aes(word, tf_idf)) +
+  geom_col(fill = "peru") +
+  scale_x_reordered() +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~ category, scales = "free") + 
+  coord_flip()
+
+jpeg("Word Importance Graph.jpeg")
+word_imp
+dev.off()
+
+```
+
+# nn 
+
+```{r}
+trctrl <- trainControl(method = "repeatedcv",
+                       number = 3, 
+                       repeats = 3, 
+                       search = "grid")
+
+nnet_mod1 <- train(x = train,
+                    y = as.factor(response_train),
+                    method = "nnet",
+                    trControl = trctrl,
+                    tuneGrid = data.frame(size = 0.1,
+                                          decay = c(0.00001,0.0001, 0.001,0.01,0.1)),
+                    MaxNWts = 12587)
+plot(nnet_mod1)
+
+
+
+   
+png("NN CV.png")
+ggplot(data = nnet_mod1) + 
+  geom_point(aes(y =Accuracy), color = "orange", size = 2.3) + 
+  xlab("Network Decay: Logarithmically Sequenced") + 
+  ylab("Cross - Validated Model Accuracy") + 
+  ggtitle("Training Performance of Feed - Forward Neural Network") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_text(aes(0.01, 0.8, label = "Max Value: 0.887"))+
+  ylim(0.79,.89) 
+dev.off()
+
+nnet_mod2 <- train(x = train,
+                    y = as.factor(response_train),
+                    method = "nnet",
+                    trControl = trctrl,
+                    tuneGrid = data.frame(size = 0.1,
+                                          decay = 0.0001),
+                    MaxNWts = 12587)
+
+nnet_pred <- predict(nnet_mod2,newdata = test)
+nnet_cm <- confusionMatrix(nnet_pred,as.factor(meta1[-train_i, ]$category))
+nnet_cm
+result1 <-  as.matrix(nnet_cm)
+
+ctable <- as.table(nnet_cm, nrow = 2, byrow = T)
+
+png("NN Confusion Matrix.png")
+fourfoldplot(ctable, color = c("goldenrod2", "peru"),
+             conf.level = 0, margin = 1, main = "Confusion Matrix")
+dev.off()
+```
+
+
+
+
+```{r}
+
+
+
+nb_mod <- train(x = train,
+                y = as.factor(response_train),
+                method = "naive_bayes",
+                trControl = trctrl,
+                tuneGrid = data.frame(laplace = seq(0,2,0.2),
+                                      usekernel = F,
+                                      adjust = F))
+
+
+naive <- ggplot(data = nb_mod) + 
+  geom_point(aes(y = Accuracy), color = "orange", size = 2.3) + 
+  xlim(0,2.0) + 
+  xlab("Laplace Correction: Sequenced") + 
+  ylab("Cross - Validated Model Accuracy") + 
+  ggtitle("Training Performance of Naive Bayes") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+png("NB CV.png")
+plot(naive)
+dev.off()
+
+
+nb_mod2 <- train(x = train,
+                y = as.factor(response_train),
+                method = "naive_bayes",
+                trControl = trctrl,
+                tuneGrid = data.frame(laplace = 0.2,
+                                      usekernel = F,
+                                      adjust = F))
+
+
+
+
+
+nb_pred <- predict(nb_mod2, newdata = test)
+confusion2 <- confusionMatrix(nb_pred, as.factor((meta1[-train_i,]$category)))
+confusion2
+result2 <-  as.matrix(confusion2)
+
+ctable2 <- as.table(confusion2, nrow = 2, byrow = T)
+
+
+
+png("Naive Bayes Confusion Matrix.png")
+fourfoldplot(ctable2, color = c("goldenrod2", "peru"),
+             conf.level = 0, margin = 1, main = "Confusion Matrix")
+dev.off()
+
+```
+
+```{r}
+trctrl <- trainControl(method = "repeatedcv",
+                       number = 1, 
+                       repeats = 2, 
+                       search = "grid")
+trctrl <- trainControl(method = "none")
+
+library(h2o)
+library(bit64)
+
+
+plr_mod <- train(x = train,
+                y = as.factor(response_train),
+                method = "lda",
+                trControl = trctrl)
+
+lda_pred <- predict(plr_mod, newdata = test)
+confusion3 <- confusionMatrix(lda_pred, as.factor((meta1[-train_i,]$category)))
+confusion3
+
+result3 <-  as.matrix(confusion3)
+
+ctable3 <- as.table(confusion3, nrow = 2, byrow = T)
+
+png("LDA Confusion Matrix.png")
+fourfoldplot(ctable3, color = c("goldenrod2", "peru"),
+             conf.level = 0, margin = 1, main = "Confusion Matrix")
+dev.off()
+
+table(lda_pred)
+```
+
+
+
+
+
+
